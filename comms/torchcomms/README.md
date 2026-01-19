@@ -13,6 +13,7 @@ collective operations for distributed training and inference.
   - [Point-to-Point Operations](#point-to-point-operations)
   - [Collective Operations](#collective-operations)
   - [Scatter and Gather Operations](#scatter-and-gather-operations)
+  - [Window-Based RMA Operations](#window-based-rma-operations)
   - [Communicator Management](#communicator-management)
   - [Work Object](#work-object)
   - [Options Configuration](#options-configuration)
@@ -339,6 +340,143 @@ Gather tensors from all ranks to the root rank.
 - **timeout** (timedelta, optional): Timeout for the operation
 - **Returns**: TorchWork object
 
+### Window-Based RMA Operations
+
+TorchComm provides window-based Remote Memory Access (RMA) operations for
+one-sided communication. Windows allow direct memory access between ranks
+without requiring receiver-side matching, enabling asynchronous communication
+patterns with reduced coordination overhead.
+
+#### Creating a Window
+
+```python
+window = comm.new_window()
+```
+
+Creates a new window object associated with the communicator.
+
+- **Returns**: TorchCommWindow object
+
+#### Window Registration
+
+```python
+window.tensor_register(tensor)
+```
+
+Register a tensor buffer with the window for RMA operations. The tensor must be
+contiguous and allocated on the same device as the communicator.
+
+- **tensor** (torch.Tensor): Contiguous tensor to register as the window buffer
+- **Raises**: RuntimeError if tensor is not contiguous, not defined, or if a
+  buffer is already registered
+
+**Requirements**:
+- Tensor must be contiguous (`tensor.is_contiguous() == True`)
+- Tensor must be on the same CUDA device as the communicator
+- Only one tensor can be registered per window at a time
+
+```python
+window.tensor_deregister()
+```
+
+Deregister the tensor buffer from the window. This operation includes a barrier
+to ensure all ranks have finished using the window before deregistration.
+
+- **Raises**: RuntimeError if no tensor is currently registered
+
+**Note**: The window destructor will automatically deregister any registered
+tensor, but explicit deregistration is recommended for proper resource
+management.
+
+#### Window Information
+
+```python
+window.get_size()
+```
+
+Get the size of the registered window buffer in bytes.
+
+- **Returns**: int - Size of the window buffer in bytes
+
+```python
+window.get_attr(peer_rank)
+```
+
+Get window attributes for a specific peer rank.
+
+- **peer_rank** (int): Rank to query attributes for
+- **Returns**: TorchCommWindowAttr object with access type information
+
+**Access Types**:
+- `TorchCommlWinAccessType.WIN_ACCESS_TYPE_UNIFIED`: Unified memory access
+- `TorchCommlWinAccessType.WIN_ACCESS_TYPE_SEPARATE`: Separate memory access
+
+#### One-Sided Put Operation
+
+```python
+window.put(tensor, dst_rank, target_offset_nelems, async_op, hints=None, timeout=None)
+```
+
+Perform a one-sided put operation, writing data directly to the remote rank's
+window buffer without receiver-side participation.
+
+- **tensor** (torch.Tensor): Data to write to the remote window
+- **dst_rank** (int): Destination rank
+- **target_offset_nelems** (int): Offset in the destination buffer (in number
+  of elements, not bytes)
+- **async_op** (bool): Whether to perform the operation asynchronously
+- **hints** (Dict[str, str], optional): Backend-specific hints
+- **timeout** (timedelta, optional): Timeout for the operation
+- **Returns**: TorchWork object
+
+**Note**: The total size (`tensor.numel() + target_offset_nelems`) must not
+exceed the window size.
+
+#### Remote Tensor Mapping
+
+```python
+window.map_remote_tensor(rank)
+```
+
+Map a remote rank's window buffer as a local tensor for direct memory access.
+This enables reading data from remote ranks without explicit communication
+calls.
+
+- **rank** (int): Remote rank whose window buffer to map
+- **Returns**: torch.Tensor - A tensor view of the remote rank's window buffer
+
+**Note**: The returned tensor shares memory with the remote window. Changes made
+by the remote rank will be visible after appropriate synchronization. Memory
+lifetime is managed by the window - the tensor becomes invalid after
+`tensor_deregister()` is called.
+
+#### Signaling Operations
+
+```python
+window.signal(dst_rank, async_op, hints=None, timeout=None)
+```
+
+Send a signal to notify a peer rank that data is ready. Used in conjunction
+with `wait_signal` for synchronization.
+
+- **dst_rank** (int): Destination rank to signal
+- **async_op** (bool): Whether to perform the operation asynchronously
+- **hints** (Dict[str, str], optional): Backend-specific hints
+- **timeout** (timedelta, optional): Timeout for the operation
+- **Returns**: TorchWork object
+
+```python
+window.wait_signal(peer_rank, async_op, hints=None, timeout=None)
+```
+
+Wait for a signal from a peer rank. Blocks until the peer has called `signal`.
+
+- **peer_rank** (int): Rank to wait for signal from
+- **async_op** (bool): Whether to perform the operation asynchronously
+- **hints** (Dict[str, str], optional): Backend-specific hints
+- **timeout** (timedelta, optional): Timeout for the operation
+- **Returns**: TorchWork object
+
 ### Communicator Management
 
 #### Split
@@ -567,3 +705,72 @@ comm = torchcomms.new_comm(
 # ...
 comm.finalize()
 ```
+
+### Window-Based RMA Example
+
+```python
+import torch
+import torchcomms
+
+# Create a communicator (ncclx backend required for window operations)
+device = torch.device("cuda:0")
+comm = torchcomms.new_comm("ncclx", device)
+
+rank = comm.get_rank()
+world_size = comm.get_size()
+
+# Allocate and register a window buffer
+# Each rank has a buffer that can be accessed by other ranks
+buffer_size = 1024
+window_buffer = torch.zeros(buffer_size, dtype=torch.float32, device=device)
+window = comm.new_window()
+window.tensor_register(window_buffer)
+
+# Prepare data to send
+if rank == 0:
+    send_data = torch.ones(256, dtype=torch.float32, device=device) * 42.0
+
+    # Put data to rank 1's window at offset 0
+    work = window.put(
+        tensor=send_data,
+        dst_rank=1,
+        target_offset_nelems=0,
+        async_op=True
+    )
+    work.wait()
+
+    # Signal rank 1 that data is ready
+    signal_work = window.signal(dst_rank=1, async_op=True)
+    signal_work.wait()
+
+elif rank == 1:
+    # Wait for signal from rank 0
+    wait_work = window.wait_signal(peer_rank=0, async_op=True)
+    wait_work.wait()
+
+    # Data is now available in window_buffer[0:256]
+    received_data = window_buffer[:256]
+    print(f"Rank 1 received: {received_data}")
+
+# Alternative: Use map_remote_tensor for direct memory access
+# This allows reading remote data without explicit put operations
+if rank == 0:
+    remote_tensor = window.map_remote_tensor(rank=1)
+    # remote_tensor provides a view of rank 1's window buffer
+    # Use after proper synchronization
+
+# Clean up
+window.tensor_deregister()
+comm.finalize()
+```
+
+**Key Concepts**:
+- **Window Registration**: `tensor_register()` makes a tensor accessible for RMA
+  operations from other ranks
+- **One-Sided Put**: `put()` writes data directly to a remote rank's buffer
+  without receiver participation
+- **Signaling**: `signal()` and `wait_signal()` provide synchronization between
+  ranks after data transfer
+- **Remote Mapping**: `map_remote_tensor()` enables direct access to remote
+  memory (when supported by hardware)
+
